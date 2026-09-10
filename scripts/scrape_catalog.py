@@ -398,6 +398,9 @@ def parse_detail_facts(html: str) -> dict:
     """Read labelled specifications only; never treat shop/set prices as unit prices."""
     soup = BeautifulSoup(html, "html.parser")
     result = {}
+    title = soup.select_one('h1.gacha-product-title')
+    if title and title.get_text(strip=True):
+        result['title'] = ' '.join(title.get_text(' ', strip=True).split())
     specs = soup.select("div.gacha-spec-item")
     if not specs:
         raise ValueError('Product detail structure changed')
@@ -411,13 +414,15 @@ def parse_detail_facts(html: str) -> dict:
         if label == '価格':
             price = extract_price(value)
             if price:
-                result.update(price=price, priceKnown=True)
+                result.update(price=price, priceKnown=True, priceStatus='known')
             elif "未定" in value:
-                result.update(price=0, priceKnown=False, _priceVerified=True)
+                result.update(price=0, priceKnown=False, priceStatus='pending', _priceVerified=True)
         elif label == '発売日':
             release = extract_release(value)
             if release:
-                result['release'] = release
+                result.update(release=release, releaseStatus='known')
+            elif '未定' in value:
+                result.update(release='', releaseStatus='pending', _releaseVerified=True)
         elif label == 'メーカー' and value and value != '不明':
             result['maker'] = value
         elif label == '種類数':
@@ -434,6 +439,14 @@ def parse_detail_facts(html: str) -> dict:
                     names.append(name)
             if names:
                 result['names'] = list(dict.fromkeys(names))
+    # Only direct article paragraphs, excluding related products/cards. Save
+    # the fact that a value is pending, never the surrounding article prose.
+    for paragraph in soup.select('.post_content > p'):
+        text = paragraph.get_text(' ', strip=True)
+        if not result.get('priceKnown') and re.search(r'(?:^|[、，,\s])(?:※\s*)?価格(?:は|：|:|\s)*未定', text):
+            result.update(price=0, priceKnown=False, priceStatus='pending', _priceVerified=True)
+        if not result.get('release') and re.search(r'(?:^|[、，,\s])(?:※\s*)?発売(?:日|時期)(?:は|：|:|\s)*未定', text):
+            result.update(release='', releaseStatus='pending', _releaseVerified=True)
     return result
 
 
@@ -458,7 +471,7 @@ def detail_targets(entries: list[dict], now: datetime | None = None) -> list[dic
         future = release and int(release[1]) * 12 + int(release[2]) > month
         interval = 7 if future else (1 if not entry.get('priceKnown') else 30)
         try:
-            checked = datetime.fromisoformat(entry.get('itemNamesCheckedAt') or '').replace(tzinfo=timezone.utc)
+            checked = datetime.fromisoformat(entry.get('factsCheckedAt') or '').replace(tzinfo=timezone.utc)
             age = (now - checked).total_seconds() / 86400
         except ValueError:
             age = float('inf')
@@ -466,7 +479,7 @@ def detail_targets(entries: list[dict], now: datetime | None = None) -> list[dic
             # Released products with missing prices are rechecked first; checked
             # timestamps ensure every product within a priority rotates.
             priority = 0 if not future and not entry.get('priceKnown') else 1
-            due.append((priority, entry.get('itemNamesCheckedAt') or '', entry['id'], entry))
+            due.append((priority, entry.get('factsCheckedAt') or '', entry['id'], entry))
     return [entry for _, _, _, entry in sorted(due, key=lambda row: row[:3])]
 
 
@@ -497,11 +510,13 @@ def fetch_detail_batch(session: requests.Session, entries: list[dict],
             # Keep its last facts and all IDs; unknown price remains hidden.
             print(f'  Source no longer available: {entry["id"]}; previous facts retained')
             entry['itemNamesCheckedAt'] = datetime.now(timezone.utc).isoformat()
+            entry['factsCheckedAt'] = entry['itemNamesCheckedAt']
             done += 1
             continue
         names = details.pop('names', None)
         entry.update(details)
         entry['itemNamesCheckedAt'] = datetime.now(timezone.utc).isoformat()
+        entry['factsCheckedAt'] = entry['itemNamesCheckedAt']
         done += 1
         if names:
             entry["items"] = stable_items(entry, names)
@@ -516,6 +531,14 @@ def fetch_detail_batch(session: requests.Session, entries: list[dict],
 # ---------------------------------------------------------------------------
 # マージ
 # ---------------------------------------------------------------------------
+
+def preserve_verified_details(entry: dict, previous: dict) -> None:
+    """A listing summary cannot replace the last verified product detail."""
+    if previous.get('factsCheckedAt'):
+        for field in ('title', 'maker', 'release', 'price', 'priceKnown', 'totalTypes', 'priceStatus', 'releaseStatus'):
+            if field in previous:
+                entry[field] = previous[field]
+
 
 def merge_entries(catalog: dict, new_entries: list[dict]) -> bool:
     """新しいエントリをカタログにマージ。変更があればTrueを返す"""
@@ -541,10 +564,10 @@ def merge_entries(catalog: dict, new_entries: list[dict]) -> bool:
             added += 1
         else:
             cur = existing[gid]
-            for field in ('title', 'maker', 'release', 'price', 'priceKnown', 'totalTypes', 'sourceUrl', 'retrievedAt', 'itemNamesCheckedAt'):
+            for field in ('title', 'maker', 'release', 'price', 'priceKnown', 'totalTypes', 'sourceUrl', 'retrievedAt', 'itemNamesCheckedAt', 'factsCheckedAt', 'priceStatus', 'releaseStatus'):
                 if field in ('price', 'priceKnown') and not entry.get('_priceVerified') and not clean.get('priceKnown') and cur.get('priceKnown'):
                     continue
-                if field in ('maker', 'release', 'totalTypes') and clean.get(field) in (None, '', '不明'):
+                if field in ('maker', 'release', 'totalTypes') and clean.get(field) in (None, '', '不明') and not (field == 'release' and entry.get('_releaseVerified')):
                     continue
                 if field in clean and cur.get(field) != clean[field]:
                     cur[field] = clean[field]
@@ -637,12 +660,20 @@ def main():
             if entry['id'] in old:
                 entry['items'] = old[entry['id']].get('items', [])
                 previous = old[entry['id']]
+                preserve_verified_details(entry, previous)
                 if not entry.get('priceKnown') and previous.get('priceKnown'):
                     entry['price'], entry['priceKnown'] = previous['price'], True
                 for field in ('maker', 'release', 'totalTypes'):
                     if entry.get(field) in (None, '', '不明') and previous.get(field):
                         entry[field] = previous[field]
                 entry['itemNamesCheckedAt'] = old[entry['id']].get('itemNamesCheckedAt')
+                for field in ('factsCheckedAt', 'priceStatus', 'releaseStatus'):
+                    if field in previous:
+                        entry[field] = previous[field]
+                if entry.get('priceKnown'):
+                    entry['priceStatus'] = 'known'
+                if entry.get('release'):
+                    entry['releaseStatus'] = 'known'
 
         if not args.skip_detail:
             for entry in entries:

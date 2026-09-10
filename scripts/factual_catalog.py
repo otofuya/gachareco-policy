@@ -4,7 +4,8 @@ import re
 from pathlib import Path
 
 FIELDS = ('id', 'seriesId', 'seriesName', 'title', 'maker', 'price', 'category',
-          'release', 'sourceUrl', 'retrievedAt', 'totalTypes', 'itemNamesCheckedAt')
+          'release', 'sourceUrl', 'retrievedAt', 'totalTypes', 'itemNamesCheckedAt',
+          'factsCheckedAt', 'priceStatus', 'releaseStatus')
 ITEM_FIELDS = ('id', 'name', 'topColor', 'bottomColor', 'charColor')
 
 
@@ -18,6 +19,9 @@ def facts(raw):
         ids.add(row['id'])
         row['title'] = ' '.join(row['title'].split())
         row['priceKnown'] = source.get('priceKnown', False)
+        for field in ('priceStatus', 'releaseStatus'):
+            if field in row and row[field] not in ('known', 'pending'):
+                raise ValueError('Invalid fact status')
         row['catalogFacts'] = True
         row['price'] = row.get('price') or 0
         if type(row['price']) is not int or not 0 <= row['price'] <= 1000000:

@@ -6,7 +6,7 @@ from pathlib import Path
 from factual_catalog import facts, publish
 from scrape_catalog import extract_price, create_session, scrape_listing_page, stable_items, fetch_detail_batch
 from datetime import datetime, timezone
-from scrape_catalog import parse_detail_facts, detail_targets, merge_entries
+from scrape_catalog import parse_detail_facts, detail_targets, merge_entries, preserve_verified_details
 from unittest.mock import patch, Mock
 import requests
 
@@ -89,7 +89,7 @@ class FactsTest(unittest.TestCase):
         self.assertEqual([r['price'] for r in rows], [500, 400])
 
     def test_detail_checks_rotate_even_when_names_are_missing(self):
-        checked = {'id': 'gi-1', '_detailUrl': 'https://gacha-island.jp/1/', 'items': [], 'itemNamesCheckedAt': '2026-09-09'}
+        checked = {'id': 'gi-1', '_detailUrl': 'https://gacha-island.jp/1/', 'items': [], 'factsCheckedAt': '2026-09-09'}
         fresh = {'id': 'gi-2', '_detailUrl': 'https://gacha-island.jp/2/', 'items': []}
         with patch('scrape_catalog.scrape_detail_facts', return_value={}) as fetch:
             fetch_detail_batch(Mock(), [checked, fresh], limit=1)
@@ -110,15 +110,40 @@ class DetailFactsTest(unittest.TestCase):
         <div class="gacha-spec-item"><h4>発売日</h4><p>2026年9月</p></div>
         <div class="gacha-spec-item"><h4>商品内容</h4><p>・<span>赤</span>いねこ<br>・白いねこ<br>※注意</p></div>
         <img src="no.jpg"><p>紹介文</p>""")
-        self.assertEqual(result, {'price': 500, 'priceKnown': True, 'release': '2026.09', 'names': ['赤いねこ', '白いねこ']})
+        self.assertEqual(result, {'price': 500, 'priceKnown': True, 'priceStatus': 'known', 'release': '2026.09', 'releaseStatus': 'known', 'names': ['赤いねこ', '白いねこ']})
 
     def test_unknown_price_is_not_fabricated(self):
-        self.assertEqual(parse_detail_facts('<div class="gacha-spec-item"><h4>価格</h4><p>※価格未定</p></div>'), {'price': 0, 'priceKnown': False, '_priceVerified': True})
+        self.assertEqual(parse_detail_facts('<div class="gacha-spec-item"><h4>価格</h4><p>※価格未定</p></div>'), {'price': 0, 'priceKnown': False, 'priceStatus': 'pending', '_priceVerified': True})
+
+    def test_title_and_explicit_pending_in_article_are_facts(self):
+        parsed = parse_detail_facts('<h1 class="gacha-product-title"> 正しい 商品名 </h1><div class="gacha-spec-item"><h4>メーカー</h4><p>メーカー</p></div><div class="post_content"><p>※発売日未定、価格未定</p><div><p>他の商品紹介文</p></div></div>')
+        self.assertEqual(parsed['title'], '正しい 商品名')
+        self.assertEqual(parsed['priceStatus'], 'pending')
+        self.assertEqual(parsed['releaseStatus'], 'pending')
+        row = dict(id='gi-1', title='古い名前', price=500, priceKnown=True, release='2026.09', items=[])
+        merge_entries({'gachas': [row], 'series': []}, [{'id': 'gi-1', **parsed, 'items': []}])
+        self.assertEqual((row['title'], row['priceKnown'], row['release']), ('正しい 商品名', False, ''))
+
+    def test_related_product_pending_does_not_override_current_product(self):
+        parsed = parse_detail_facts('<div class="gacha-spec-item"><h4>価格</h4><p>500円</p></div><div class="post_content"><div><p>※発売日未定、価格未定</p></div></div>')
+        self.assertTrue(parsed['priceKnown'])
+        self.assertNotIn('releaseStatus', parsed)
+
+    def test_listing_cannot_turn_verified_pending_price_into_known_price(self):
+        previous = dict(factsCheckedAt='2026-09-10', title='詳細の名前', price=0, priceKnown=False, priceStatus='pending', release='', releaseStatus='pending')
+        listing = dict(title='一覧の古い名前', price=500, priceKnown=True, release='2026.09')
+        preserve_verified_details(listing, previous)
+        self.assertEqual((listing['title'], listing['priceKnown'], listing['release']), ('詳細の名前', False, ''))
+
+    def test_old_name_only_checks_do_not_skip_full_fact_verification(self):
+        now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        rows = [dict(id='gi-1', release='2026.09', priceKnown=True, itemNamesCheckedAt=now.isoformat())]
+        self.assertEqual(detail_targets(rows, now), rows)
 
     def test_due_queue_revisits_unknown_prices_after_release(self):
-        rows = [dict(id='gi-1', release='2026.10', priceKnown=False, itemNamesCheckedAt='2026-09-30T00:00:00+00:00'),
-                dict(id='gi-2', release='2026.11', priceKnown=False, itemNamesCheckedAt='2026-09-30T00:00:00+00:00'),
-                dict(id='gi-3', release='2026.09', priceKnown=True, itemNamesCheckedAt='2026-09-30T00:00:00+00:00')]
+        rows = [dict(id='gi-1', release='2026.10', priceKnown=False, factsCheckedAt='2026-09-30T00:00:00+00:00'),
+                dict(id='gi-2', release='2026.11', priceKnown=False, factsCheckedAt='2026-09-30T00:00:00+00:00'),
+                dict(id='gi-3', release='2026.09', priceKnown=True, factsCheckedAt='2026-09-30T00:00:00+00:00')]
         due = detail_targets(rows, datetime(2026, 10, 1, tzinfo=timezone.utc))
         self.assertEqual([r['id'] for r in due], ['gi-1'])
 
