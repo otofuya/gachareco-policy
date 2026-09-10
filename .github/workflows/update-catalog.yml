@@ -22,7 +22,7 @@ jobs:
         run: |
           set -e
           python scripts/test_factual_catalog.py
-          python scripts/scrape_catalog.py --detail-limit 200
+          python scripts/scrape_catalog.py --detail-limit 1000
       - name: Publish only a validated catalog
         run: |
           set -e

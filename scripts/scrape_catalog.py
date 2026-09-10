@@ -15,7 +15,7 @@ import re
 import sys
 import time
 from urllib.parse import urljoin, urlparse
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from factual_catalog import publish
 from pathlib import Path
 
@@ -124,6 +124,8 @@ def load_catalog() -> dict:
 
 
 def save_catalog(catalog: dict) -> None:
+    # Seed products without an Island source belong only in legacy local references.
+    catalog = {**catalog, 'gachas': [g for g in catalog['gachas'] if re.fullmatch(r'gi-\d+', g['id'])]}
     publish(catalog, CATALOG_PATH.with_name('gacha-facts.json'))
 
 
@@ -392,38 +394,86 @@ def scrape_all_listings(session: requests.Session, max_pages: int | None = None)
 # 詳細ページスクレイピング（アイテム名取得）
 # ---------------------------------------------------------------------------
 
-def scrape_detail_items(session: requests.Session, detail_url: str) -> list[str] | None:
-    """詳細ページから商品内容（アイテム名リスト）を取得"""
-    try:
-        r = session.get(detail_url, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+def parse_detail_facts(html: str) -> dict:
+    """Read labelled specifications only; never treat shop/set prices as unit prices."""
+    soup = BeautifulSoup(html, "html.parser")
+    result = {}
+    specs = soup.select("div.gacha-spec-item")
+    if not specs:
+        raise ValueError('Product detail structure changed')
+    for spec in specs:
+        heading = spec.select_one('h4')
+        body = spec.select_one('p')
+        if not heading or not body:
+            continue
+        label = heading.get_text(strip=True)
+        value = body.get_text(' ', strip=True)
+        if label == '価格':
+            price = extract_price(value)
+            if price:
+                result.update(price=price, priceKnown=True)
+            elif "未定" in value:
+                result.update(price=0, priceKnown=False, _priceVerified=True)
+        elif label == '発売日':
+            release = extract_release(value)
+            if release:
+                result['release'] = release
+        elif label == 'メーカー' and value and value != '不明':
+            result['maker'] = value
+        elif label == '種類数':
+            count = re.search(r'全\s*(\d+)\s*種', value)
+            if count:
+                result['totalTypes'] = int(count[1])
+        elif label == '商品内容':
+            names = []
+            for br in body.find_all('br'):
+                br.replace_with('\n')
+            for line in body.get_text().splitlines():
+                name = line.lstrip('・● ').strip()
+                if name and len(name) <= 100 and not re.match(r'^(※|注[意：:]|対象年齢|発売元|販売元|©|Copyright)', name, re.I):
+                    names.append(name)
+            if names:
+                result['names'] = list(dict.fromkeys(names))
+    return result
 
-        for spec in soup.select("div.gacha-spec-item"):
-            h4 = spec.select_one("h4")
-            if h4 and "商品内容" in h4.get_text(strip=True):
-                p = spec.select_one("p")
-                if not p:
-                    return None
-                raw = p.decode_contents()
-                parts = re.split(r"<br\s*/?>", raw)
-                names = []
-                for part in parts:
-                    clean = BeautifulSoup(part, 'html.parser').get_text(' ', strip=True)
-                    clean = clean.lstrip("・").strip()
-                    if clean and len(clean) <= 100 and not re.match(r'^(※|注[意：:]|対象年齢|発売元|販売元|©|Copyright)', clean, re.I):
-                        names.append(clean)
-                return names if names else None
-        return None
-    except Exception:
-        raise
+
+def scrape_detail_facts(session: requests.Session, detail_url: str) -> dict:
+    response = session.get(detail_url, timeout=20)
+    response.raise_for_status()
+    return parse_detail_facts(response.text)
+
+
+def scrape_detail_items(session: requests.Session, detail_url: str) -> list[str] | None:
+    return scrape_detail_facts(session, detail_url).get('names')
+
+
+def detail_targets(entries: list[dict], now: datetime | None = None) -> list[dict]:
+    """Due checks rotate; a missing price cannot consume the daily budget forever."""
+    now = now or datetime.now(timezone.utc)
+    japan = now.astimezone(timezone(timedelta(hours=9)))
+    month = japan.year * 12 + japan.month
+    due = []
+    for entry in entries:
+        release = re.fullmatch(r'(\d{4})\.(\d{2})', entry.get('release', ''))
+        future = release and int(release[1]) * 12 + int(release[2]) > month
+        interval = 7 if future else (1 if not entry.get('priceKnown') else 30)
+        try:
+            checked = datetime.fromisoformat(entry.get('itemNamesCheckedAt') or '').replace(tzinfo=timezone.utc)
+            age = (now - checked).total_seconds() / 86400
+        except ValueError:
+            age = float('inf')
+        if age >= interval:
+            # Released products with missing prices are rechecked first; checked
+            # timestamps ensure every product within a priority rotates.
+            priority = 0 if not future and not entry.get('priceKnown') else 1
+            due.append((priority, entry.get('itemNamesCheckedAt') or '', entry['id'], entry))
+    return [entry for _, _, _, entry in sorted(due, key=lambda row: row[:3])]
 
 
 def fetch_detail_batch(session: requests.Session, entries: list[dict],
                        limit: int | None = 200, workers: int = 1) -> int:
     """Sequential requests stop immediately on failure; oldest checks run first."""
-    targets = sorted(entries, key=lambda e: (
-        e.get('itemNamesCheckedAt') or '', 0 if has_generic_items(e) else 1))
+    targets = detail_targets(entries)
     if limit is not None:
         targets = targets[:limit]
     if not targets:
@@ -438,7 +488,19 @@ def fetch_detail_batch(session: requests.Session, entries: list[dict],
         url = entry.get("_detailUrl")
         if not url:
             continue
-        names = scrape_detail_items(session, url)
+        try:
+            details = scrape_detail_facts(session, url)
+        except requests.HTTPError as error:
+            if error.response is None or error.response.status_code not in (404, 410):
+                raise
+            # A removed product must not block the entire catalog's daily refresh.
+            # Keep its last facts and all IDs; unknown price remains hidden.
+            print(f'  Source no longer available: {entry["id"]}; previous facts retained')
+            entry['itemNamesCheckedAt'] = datetime.now(timezone.utc).isoformat()
+            done += 1
+            continue
+        names = details.pop('names', None)
+        entry.update(details)
         entry['itemNamesCheckedAt'] = datetime.now(timezone.utc).isoformat()
         done += 1
         if names:
@@ -480,6 +542,10 @@ def merge_entries(catalog: dict, new_entries: list[dict]) -> bool:
         else:
             cur = existing[gid]
             for field in ('title', 'maker', 'release', 'price', 'priceKnown', 'totalTypes', 'sourceUrl', 'retrievedAt', 'itemNamesCheckedAt'):
+                if field in ('price', 'priceKnown') and not entry.get('_priceVerified') and not clean.get('priceKnown') and cur.get('priceKnown'):
+                    continue
+                if field in ('maker', 'release', 'totalTypes') and clean.get(field) in (None, '', '不明'):
+                    continue
                 if field in clean and cur.get(field) != clean[field]:
                     cur[field] = clean[field]
                     changed = True
@@ -570,6 +636,12 @@ def main():
         for entry in entries:
             if entry['id'] in old:
                 entry['items'] = old[entry['id']].get('items', [])
+                previous = old[entry['id']]
+                if not entry.get('priceKnown') and previous.get('priceKnown'):
+                    entry['price'], entry['priceKnown'] = previous['price'], True
+                for field in ('maker', 'release', 'totalTypes'):
+                    if entry.get(field) in (None, '', '不明') and previous.get(field):
+                        entry[field] = previous[field]
                 entry['itemNamesCheckedAt'] = old[entry['id']].get('itemNamesCheckedAt')
 
         if not args.skip_detail:

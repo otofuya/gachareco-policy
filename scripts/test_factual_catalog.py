@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from factual_catalog import facts, publish
 from scrape_catalog import extract_price, create_session, scrape_listing_page, stable_items, fetch_detail_batch
+from datetime import datetime, timezone
+from scrape_catalog import parse_detail_facts, detail_targets, merge_entries
 from unittest.mock import patch, Mock
 import requests
 
@@ -73,14 +75,23 @@ class FactsTest(unittest.TestCase):
 
     def test_detail_batch_stops_on_first_error(self):
         rows = [{'id': f'gi-{n}', '_detailUrl': f'https://gacha-island.jp/{n}/', 'items': []} for n in range(3)]
-        with patch('scrape_catalog.scrape_detail_items', side_effect=requests.HTTPError('429')) as fetch:
+        with patch('scrape_catalog.scrape_detail_facts', side_effect=requests.HTTPError('429')) as fetch:
             with self.assertRaises(requests.HTTPError): fetch_detail_batch(Mock(), rows)
             self.assertEqual(fetch.call_count, 1)
+
+    def test_removed_product_retains_facts_without_blocking_others(self):
+        response = requests.Response()
+        response.status_code = 404
+        rows = [dict(id='gi-1', _detailUrl='https://gacha-island.jp/1/', items=[], price=500, priceKnown=True),
+                dict(id='gi-2', _detailUrl='https://gacha-island.jp/2/', items=[], price=300, priceKnown=True)]
+        with patch('scrape_catalog.scrape_detail_facts', side_effect=[requests.HTTPError(response=response), {'price': 400, 'priceKnown': True}]):
+            fetch_detail_batch(Mock(), rows)
+        self.assertEqual([r['price'] for r in rows], [500, 400])
 
     def test_detail_checks_rotate_even_when_names_are_missing(self):
         checked = {'id': 'gi-1', '_detailUrl': 'https://gacha-island.jp/1/', 'items': [], 'itemNamesCheckedAt': '2026-09-09'}
         fresh = {'id': 'gi-2', '_detailUrl': 'https://gacha-island.jp/2/', 'items': []}
-        with patch('scrape_catalog.scrape_detail_items', return_value=None) as fetch:
+        with patch('scrape_catalog.scrape_detail_facts', return_value={}) as fetch:
             fetch_detail_batch(Mock(), [checked, fresh], limit=1)
             self.assertEqual(fetch.call_args.args[1], fresh['_detailUrl'])
             self.assertTrue(fresh.get('itemNamesCheckedAt'))
@@ -92,5 +103,29 @@ class FactsTest(unittest.TestCase):
         self.assertEqual(result['id'], 'legacy-item')
         self.assertEqual(result['name'], '種類未確認')
 
+
+class DetailFactsTest(unittest.TestCase):
+    def test_labelled_price_names_and_no_prose(self):
+        result = parse_detail_facts("""<div class="gacha-spec-item"><h4>価格</h4><p>1回500円</p></div>
+        <div class="gacha-spec-item"><h4>発売日</h4><p>2026年9月</p></div>
+        <div class="gacha-spec-item"><h4>商品内容</h4><p>・<span>赤</span>いねこ<br>・白いねこ<br>※注意</p></div>
+        <img src="no.jpg"><p>紹介文</p>""")
+        self.assertEqual(result, {'price': 500, 'priceKnown': True, 'release': '2026.09', 'names': ['赤いねこ', '白いねこ']})
+
+    def test_unknown_price_is_not_fabricated(self):
+        self.assertEqual(parse_detail_facts('<div class="gacha-spec-item"><h4>価格</h4><p>※価格未定</p></div>'), {'price': 0, 'priceKnown': False, '_priceVerified': True})
+
+    def test_due_queue_revisits_unknown_prices_after_release(self):
+        rows = [dict(id='gi-1', release='2026.10', priceKnown=False, itemNamesCheckedAt='2026-09-30T00:00:00+00:00'),
+                dict(id='gi-2', release='2026.11', priceKnown=False, itemNamesCheckedAt='2026-09-30T00:00:00+00:00'),
+                dict(id='gi-3', release='2026.09', priceKnown=True, itemNamesCheckedAt='2026-09-30T00:00:00+00:00')]
+        due = detail_targets(rows, datetime(2026, 10, 1, tzinfo=timezone.utc))
+        self.assertEqual([r['id'] for r in due], ['gi-1'])
+
+    def test_listing_missing_price_does_not_erase_known_price(self):
+        original = dict(id='gi-1', title='商品', price=500, priceKnown=True, items=[])
+        catalog = {'gachas': [original], 'series': []}
+        merge_entries(catalog, [dict(id='gi-1', title='商品', price=0, priceKnown=False, items=[])])
+        self.assertEqual((original['price'], original['priceKnown']), (500, True))
 
 if __name__ == '__main__': unittest.main()
